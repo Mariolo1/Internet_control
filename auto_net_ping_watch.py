@@ -6,6 +6,13 @@ Automatyczny monitor Internetu przez ICMP ping (Linux / Docker).
 - Pinguje bramę i 1.1.1.1, 8.8.8.8, 9.9.9.9.
 - Wysyła e-maile przy starcie/końcu przerwy.
 - Konfiguracja wyłącznie przez zmienne środowiskowe (wygodnie via .env).
+
+English summary:
+A lightweight ICMP-based connectivity watchdog that:
+- discovers the default gateway,
+- pings the gateway and stable public hosts,
+- detects outages with thresholds and sends email notifications,
+- is fully configurable via environment variables (Docker/.env friendly).
 """
 
 import os
@@ -34,27 +41,66 @@ MAIL_TO = [x.strip() for x in os.getenv("ANPW_MAIL_TO", "").split(",") if x.stri
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+
 def now_local() -> str:
+    """
+    Return a human-readable timestamp in the local timezone.
+
+    Returns:
+        str: Local time formatted as 'YYYY-MM-DD HH:MM:SS TZ'.
+    """
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
+
 def fmt_dur(sec: float) -> str:
+    """
+    Format a duration in seconds into a compact 'Hh Mm Ss' string.
+
+    Args:
+        sec (float): Duration in seconds.
+
+    Returns:
+        str: Formatted duration like '1h 3m 05s' or '42s'.
+    """
     sec = int(round(sec))
     m, s = divmod(sec, 60)
     h, m = divmod(m, 60)
     out = []
-    if h: out.append(f"{h}h")
-    if h or m: out.append(f"{m}m")
+    if h:
+        out.append(f"{h}h")
+    if h or m:
+        out.append(f"{m}m")
     out.append(f"{s}s")
     return " ".join(out)
 
+
 def run_cmd(args: list[str]) -> tuple[int, str]:
+    """
+    Run a shell command and capture its exit code and combined stdout/stderr.
+
+    Args:
+        args (list[str]): Command and arguments, e.g. ['ip', '-4', 'route'].
+
+    Returns:
+        tuple[int, str]: (return_code, output_text). On exceptions, returns (1, 'ERR: <message>').
+    """
     try:
         cp = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         return cp.returncode, cp.stdout.strip()
     except Exception as e:
         return 1, f"ERR: {e}"
 
+
 def discover_default_gateway() -> str | None:
+    """
+    Discover the IPv4 default gateway using `ip route`.
+
+    The function first tries `ip -4 route show default` and then falls back to
+    `ip route`. It parses the 'default via <GW>' line.
+
+    Returns:
+        str | None: Gateway IP address if found, otherwise None.
+    """
     rc, out = run_cmd(["ip", "-4", "route", "show", "default"])
     if rc == 0 and out:
         for line in out.splitlines():
@@ -77,7 +123,21 @@ def discover_default_gateway() -> str | None:
                     continue
     return None
 
+
 def ping_once(host: str, timeout_s: int = 1) -> bool:
+    """
+    Send a single ICMP echo request using the system `ping` utility.
+
+    Args:
+        host (str): Hostname or IPv4 address to ping.
+        timeout_s (int, optional): Per-packet timeout in seconds. Defaults to 1.
+
+    Returns:
+        bool: True if the ping command returns exit code 0; False otherwise.
+
+    Notes:
+        Requires `iputils-ping` in the container/image and NET_RAW capabilities.
+    """
     try:
         res = subprocess.run(
             ["ping", "-n", "-c", "1", "-W", str(timeout_s), host],
@@ -85,13 +145,29 @@ def ping_once(host: str, timeout_s: int = 1) -> bool:
         )
         return res.returncode == 0
     except FileNotFoundError:
-        logging.error("Brak `ping` w obrazie. Zainstaluj iputils-ping.")
+        logging.error("Missing `ping` binary. Install iputils-ping in the image.")
         time.sleep(5)
         return False
 
+
 def send_mail(subject: str, body: str):
+    """
+    Send a plaintext email notification using SMTP with optional STARTTLS/SSL.
+
+    Args:
+        subject (str): Email subject.
+        body (str): Plaintext body to send.
+
+    Side Effects:
+        Sends an email to recipients specified in `MAIL_TO`. If `MAIL_TO` is empty,
+        the function logs a warning and returns without sending.
+
+    Notes:
+        - Uses SMTPS on port 465 or STARTTLS for other ports (e.g., 587).
+        - Uses credentials from environment variables when provided.
+    """
     if not MAIL_TO:
-        logging.warning("MAIL_TO nie ustawione – pomijam wysyłkę e-mail.")
+        logging.warning("MAIL_TO not set – skipping email delivery.")
         return
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -111,12 +187,30 @@ def send_mail(subject: str, body: str):
                 s.ehlo()
                 s.starttls(context=ssl.create_default_context())
             except smtplib.SMTPNotSupportedError:
+                # Local MTA without TLS (e.g., port 25).
                 pass
             if SMTP_USER:
                 s.login(SMTP_USER, SMTP_PASS)
             s.send_message(msg)
 
+
 def classify_status(router_ip: str) -> tuple[bool, str]:
+    """
+    Classify current connectivity state based on gateway and public targets.
+
+    Logic:
+        - If no router IP is known -> ('NO', 'NO_GATEWAY')
+        - If router does not reply -> ('NO', 'LAN_DOWN')
+        - If router replies and any PUBLIC_HOSTS replies -> ('YES', 'UP')
+        - Otherwise -> ('NO', 'INTERNET_DOWN')
+
+    Args:
+        router_ip (str): Detected gateway IP (may be None/empty).
+
+    Returns:
+        tuple[bool, str]: (ok, label) where label is one of:
+            'UP', 'LAN_DOWN', 'INTERNET_DOWN', 'NO_GATEWAY'.
+    """
     if not router_ip:
         return False, "NO_GATEWAY"
     if not ping_once(router_ip, PING_TIMEOUT_S):
@@ -125,7 +219,23 @@ def classify_status(router_ip: str) -> tuple[bool, str]:
         return True, "UP"
     return False, "INTERNET_DOWN"
 
+
 def main():
+    """
+    Main monitoring loop.
+
+    Responsibilities:
+        - Discover and periodically re-discover the default gateway.
+        - Probe connectivity at a fixed interval.
+        - Detect outage start/end using consecutive fail/success thresholds.
+        - Send email notifications on outage start (optional) and end.
+        - Log all state changes.
+
+    Environment:
+        Reads all behavior/SMTP settings from environment variables (ANPW_*).
+
+    Runs forever until interrupted (e.g., SIGINT under local run or container stop).
+    """
     logging.info("Auto Ping Watch — start (Docker)")
     router_ip = discover_default_gateway()
     if router_ip:
@@ -205,6 +315,7 @@ def main():
                         logging.error(f"Błąd wysyłki e-maila: {e}")
 
         time.sleep(INTERVAL_SEC)
+
 
 if __name__ == "__main__":
     try:
