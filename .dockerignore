@@ -1,0 +1,9 @@
+# nie pakuj tych plików do obrazu
+.env
+.env.*
+*.log
+__pycache__/
+*.pyc
+.git/
+.gitignore
+README*
