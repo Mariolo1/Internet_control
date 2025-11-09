@@ -8,6 +8,4 @@ package.json
 __pycache__/
 *.pyc
 
-# Node (gdyby się pojawiło)
-node_modules/
-package-lock.json
+
