@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 Automatyczny monitor Internetu przez ICMP ping (Linux / Docker).
-- Sam wykrywa bramę (ip route).
-- Pinguje bramę i 1.1.1.1, 8.8.8.8, 9.9.9.9.
-- Wysyła e-maile przy starcie/końcu przerwy.
-- Konfiguracja wyłącznie przez zmienne środowiskowe (wygodnie via .env).
 
-English summary:
-A lightweight ICMP-based connectivity watchdog that:
-- discovers the default gateway,
-- pings the gateway and stable public hosts,
-- detects outages with thresholds and sends email notifications,
-- is fully configurable via environment variables (Docker/.env friendly).
+Teraz z trzema poziomami diagnostyki:
+- LAN (brama / router),
+- WAN (opcjonalny host typu duckdns – ANPW_WAN_HOST),
+- Internet (PUBLIC_HOSTS, np. 1.1.1.1, 8.8.8.8, 9.9.9.9).
+
+Wykrywa:
+- brak bramy (NO_GATEWAY),
+- problem w LAN (LAN_DOWN),
+- brak dostępu do Internetu przy działającym LAN (INTERNET_DOWN),
+- raportuje w mailu stany: LAN, WAN, INTERNET.
 """
 
 import os
@@ -24,7 +24,14 @@ import ssl
 from email.message import EmailMessage
 from datetime import datetime
 
-PUBLIC_HOSTS = [h.strip() for h in os.getenv("ANPW_PUBLIC", "1.1.1.1,8.8.8.8,9.9.9.9").split(",") if h.strip()]
+PUBLIC_HOSTS = [
+    h.strip()
+    for h in os.getenv("ANPW_PUBLIC", "1.1.1.1,8.8.8.8,9.9.9.9").split(",")
+    if h.strip()
+]
+
+WAN_HOST = os.getenv("ANPW_WAN_HOST", "").strip() or None
+
 INTERVAL_SEC = int(os.getenv("ANPW_INTERVAL", "5"))
 FAIL_THRESHOLD = int(os.getenv("ANPW_FAIL_THRESHOLD", "3"))
 OK_THRESHOLD = int(os.getenv("ANPW_OK_THRESHOLD", "2"))
@@ -43,25 +50,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 
 def now_local() -> str:
-    """
-    Return a human-readable timestamp in the local timezone.
-
-    Returns:
-        str: Local time formatted as 'YYYY-MM-DD HH:MM:SS TZ'.
-    """
+    """Zwraca timestamp lokalny 'YYYY-MM-DD HH:MM:SS TZ'."""
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def fmt_dur(sec: float) -> str:
-    """
-    Format a duration in seconds into a compact 'Hh Mm Ss' string.
-
-    Args:
-        sec (float): Duration in seconds.
-
-    Returns:
-        str: Formatted duration like '1h 3m 05s' or '42s'.
-    """
+    """Formatowanie czasu trwania w sek. do 'Hh Mm Ss'."""
     sec = int(round(sec))
     m, s = divmod(sec, 60)
     h, m = divmod(m, 60)
@@ -75,17 +69,11 @@ def fmt_dur(sec: float) -> str:
 
 
 def run_cmd(args: list[str]) -> tuple[int, str]:
-    """
-    Run a shell command and capture its exit code and combined stdout/stderr.
-
-    Args:
-        args (list[str]): Command and arguments, e.g. ['ip', '-4', 'route'].
-
-    Returns:
-        tuple[int, str]: (return_code, output_text). On exceptions, returns (1, 'ERR: <message>').
-    """
+    """Uruchom komendę i zwróć (rc, output)."""
     try:
-        cp = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        cp = subprocess.run(
+            args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
         return cp.returncode, cp.stdout.strip()
     except Exception as e:
         return 1, f"ERR: {e}"
@@ -93,13 +81,7 @@ def run_cmd(args: list[str]) -> tuple[int, str]:
 
 def discover_default_gateway() -> str | None:
     """
-    Discover the IPv4 default gateway using `ip route`.
-
-    The function first tries `ip -4 route show default` and then falls back to
-    `ip route`. It parses the 'default via <GW>' line.
-
-    Returns:
-        str | None: Gateway IP address if found, otherwise None.
+    Wykryj bramę domyślną IPv4 poprzez `ip route`.
     """
     rc, out = run_cmd(["ip", "-4", "route", "show", "default"])
     if rc == 0 and out:
@@ -111,6 +93,7 @@ def discover_default_gateway() -> str | None:
                     return parts[idx + 1]
                 except (ValueError, IndexError):
                     continue
+
     rc, out = run_cmd(["ip", "route"])
     if rc == 0 and out:
         for line in out.splitlines():
@@ -126,48 +109,29 @@ def discover_default_gateway() -> str | None:
 
 def ping_once(host: str, timeout_s: int = 1) -> bool:
     """
-    Send a single ICMP echo request using the system `ping` utility.
+    Jednorazowy ping ICMP do hosta.
 
-    Args:
-        host (str): Hostname or IPv4 address to ping.
-        timeout_s (int, optional): Per-packet timeout in seconds. Defaults to 1.
-
-    Returns:
-        bool: True if the ping command returns exit code 0; False otherwise.
-
-    Notes:
-        Requires `iputils-ping` in the container/image and NET_RAW capabilities.
+    Zwraca True jeśli `ping` zwróci kod 0.
     """
     try:
         res = subprocess.run(
             ["ping", "-n", "-c", "1", "-W", str(timeout_s), host],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         return res.returncode == 0
     except FileNotFoundError:
-        logging.error("Missing `ping` binary. Install iputils-ping in the image.")
+        logging.error("Brak binarki `ping`. Zainstaluj iputils-ping w obrazie.")
         time.sleep(5)
         return False
 
 
 def send_mail(subject: str, body: str):
     """
-    Send a plaintext email notification using SMTP with optional STARTTLS/SSL.
-
-    Args:
-        subject (str): Email subject.
-        body (str): Plaintext body to send.
-
-    Side Effects:
-        Sends an email to recipients specified in `MAIL_TO`. If `MAIL_TO` is empty,
-        the function logs a warning and returns without sending.
-
-    Notes:
-        - Uses SMTPS on port 465 or STARTTLS for other ports (e.g., 587).
-        - Uses credentials from environment variables when provided.
+    Wyślij maila tekstowego przez SMTP (STARTTLS/SSL).
     """
     if not MAIL_TO:
-        logging.warning("MAIL_TO not set – skipping email delivery.")
+        logging.warning("MAIL_TO nie ustawione – pomijam wysyłkę e-maila.")
         return
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -187,61 +151,98 @@ def send_mail(subject: str, body: str):
                 s.ehlo()
                 s.starttls(context=ssl.create_default_context())
             except smtplib.SMTPNotSupportedError:
-                # Local MTA without TLS (e.g., port 25).
+                # Np. lokalny MTA na porcie 25.
                 pass
             if SMTP_USER:
                 s.login(SMTP_USER, SMTP_PASS)
             s.send_message(msg)
 
 
-def classify_status(router_ip: str) -> tuple[bool, str]:
+def classify_status(router_ip: str | None) -> tuple[bool, str, dict[str, str]]:
     """
-    Classify current connectivity state based on gateway and public targets.
+    Zwraca (ok, label, diag) gdzie:
+      - ok: bool określający, czy Internet jest dostępny (INTERNET=UP),
+      - label: UP / LAN_DOWN / INTERNET_DOWN / NO_GATEWAY,
+      - diag: słownik z kluczami 'LAN', 'WAN', 'INTERNET'.
 
-    Logic:
-        - If no router IP is known -> ('NO', 'NO_GATEWAY')
-        - If router does not reply -> ('NO', 'LAN_DOWN')
-        - If router replies and any PUBLIC_HOSTS replies -> ('YES', 'UP')
-        - Otherwise -> ('NO', 'INTERNET_DOWN')
+    Logika:
+      - LAN:
+          router_ip brak     -> LAN = NO_GATEWAY
+          ping(brama) false  -> LAN = DOWN
+          ping(brama) true   -> LAN = UP
+      - WAN (opcjonalny):
+          WAN_HOST brak      -> WAN = N/A
+          ping(WAN_HOST)     -> WAN = UP / DOWN
+      - INTERNET:
+          jeśli LAN != UP    -> INTERNET = DOWN
+          jeśli LAN == UP
+             i ANY ping(PUBLIC_HOSTS) -> INTERNET = UP
+             else                     -> INTERNET = DOWN
 
-    Args:
-        router_ip (str): Detected gateway IP (may be None/empty).
-
-    Returns:
-        tuple[bool, str]: (ok, label) where label is one of:
-            'UP', 'LAN_DOWN', 'INTERNET_DOWN', 'NO_GATEWAY'.
+    Label:
+      - NO_GATEWAY (brak bramy),
+      - LAN_DOWN (brama nie odpowiada),
+      - UP (Internet działa),
+      - INTERNET_DOWN (brama OK, Internet nie działa).
     """
+    diag: dict[str, str] = {
+        "LAN": "DOWN",
+        "WAN": "N/A",
+        "INTERNET": "DOWN",
+    }
+
+    # LAN
     if not router_ip:
-        return False, "NO_GATEWAY"
-    if not ping_once(router_ip, PING_TIMEOUT_S):
-        return False, "LAN_DOWN"
-    if any(ping_once(h, PING_TIMEOUT_S) for h in PUBLIC_HOSTS):
-        return True, "UP"
-    return False, "INTERNET_DOWN"
+        diag["LAN"] = "NO_GATEWAY"
+        # przy braku bramy WAN/INTERNET i tak są DOWN/N/A
+        return False, "NO_GATEWAY", diag
+
+    lan_ok = ping_once(router_ip, PING_TIMEOUT_S)
+    diag["LAN"] = "UP" if lan_ok else "DOWN"
+
+    # WAN (opcjonalnie)
+    if WAN_HOST:
+        wan_ok = ping_once(WAN_HOST, PING_TIMEOUT_S)
+        diag["WAN"] = "UP" if wan_ok else "DOWN"
+    else:
+        diag["WAN"] = "N/A"
+
+    # INTERNET – tylko jeśli LAN jest UP
+    internet_ok = False
+    if lan_ok:
+        internet_ok = any(ping_once(h, PING_TIMEOUT_S) for h in PUBLIC_HOSTS)
+    diag["INTERNET"] = "UP" if internet_ok else "DOWN"
+
+    # label / ok
+    if not lan_ok:
+        # brama nie odpowiada
+        return False, "LAN_DOWN", diag
+    if internet_ok:
+        return True, "UP", diag
+    else:
+        return False, "INTERNET_DOWN", diag
+
+
+def format_diag(diag: dict[str, str]) -> str:
+    """Ładny string z diagnostyką LAN/WAN/INTERNET."""
+    return f"LAN={diag['LAN']}, WAN={diag['WAN']}, INTERNET={diag['INTERNET']}"
 
 
 def main():
     """
-    Main monitoring loop.
-
-    Responsibilities:
-        - Discover and periodically re-discover the default gateway.
-        - Probe connectivity at a fixed interval.
-        - Detect outage start/end using consecutive fail/success thresholds.
-        - Send email notifications on outage start (optional) and end.
-        - Log all state changes.
-
-    Environment:
-        Reads all behavior/SMTP settings from environment variables (ANPW_*).
-
-    Runs forever until interrupted (e.g., SIGINT under local run or container stop).
+    Główna pętla monitorująca.
     """
-    logging.info("Auto Ping Watch — start (Docker)")
+    logging.info("Auto Ping Watch — start (Docker, LAN+WAN+Internet)")
     router_ip = discover_default_gateway()
     if router_ip:
         logging.info(f"Wykryta brama (router): {router_ip}")
     else:
         logging.warning("Nie wykryto bramy. Spróbuję ponownie w trakcie pracy.")
+
+    if WAN_HOST:
+        logging.info(f"WAN host (self-check): {WAN_HOST}")
+    else:
+        logging.info("WAN host (ANPW_WAN_HOST) nie ustawiony – pomijam ten test.")
 
     consecutive_fail = 0
     consecutive_ok = 0
@@ -252,6 +253,7 @@ def main():
 
     while True:
         now_ts = time.time()
+        # okresowe ponowne wykrywanie bramy
         if now_ts - last_router_check >= ROUTER_REDISCOVER_EVERY or router_ip is None:
             new_router = discover_default_gateway()
             last_router_check = now_ts
@@ -262,7 +264,7 @@ def main():
                 logging.info(f"Wykryto bramę: {new_router}")
                 router_ip = new_router
 
-        ok, kind = classify_status(router_ip)
+        ok, kind, diag = classify_status(router_ip)
 
         if ok:
             consecutive_ok += 1
@@ -270,7 +272,11 @@ def main():
             if in_outage and consecutive_ok >= OK_THRESHOLD:
                 duration = time.time() - outage_start_ts
                 end_str = now_local()
-                start_str = datetime.fromtimestamp(outage_start_ts).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+                start_str = (
+                    datetime.fromtimestamp(outage_start_ts)
+                    .astimezone()
+                    .strftime("%Y-%m-%d %H:%M:%S %Z")
+                )
                 subject = f"[AUTO-PING] Koniec przerwy ({fmt_dur(duration)})"
                 body = (
                     "Raport przerwy w dostępie do Internetu (ICMP)\n\n"
@@ -278,8 +284,10 @@ def main():
                     f"Przerwa rozpoczęła się: {start_str}\n"
                     f"Przerwa zakończyła się: {end_str}\n"
                     f"Czas trwania: {fmt_dur(duration)}\n\n"
+                    f"Diagnostyka końcowa: {format_diag(diag)}\n\n"
                     f"Router (brama): {router_ip or 'nieznany'}\n"
                     f"Cele publiczne: {', '.join(PUBLIC_HOSTS)}\n"
+                    f"Host WAN: {WAN_HOST or 'brak (ANPW_WAN_HOST)'}\n"
                     f"Progi: FAIL>={FAIL_THRESHOLD}, OK>={OK_THRESHOLD}, interwał={INTERVAL_SEC}s\n"
                 )
                 try:
@@ -297,15 +305,19 @@ def main():
                 in_outage = True
                 outage_start_ts = time.time()
                 outage_kind = kind
-                logging.warning(f"Wykryto przerwę: {kind} (router={router_ip}, public={PUBLIC_HOSTS})")
+                logging.warning(
+                    f"Wykryto przerwę: {kind} (router={router_ip}, public={PUBLIC_HOSTS}, diag={format_diag(diag)})"
+                )
                 if NOTIFY_ON_START:
                     subject = f"[AUTO-PING] Przerwa wykryta: {kind}"
                     body = (
                         "Wykryto przerwę w dostępie do Internetu (ICMP)\n\n"
                         f"Rodzaj przerwy: {kind}\n"
                         f"Start przerwy: {now_local()}\n"
+                        f"Diagnostyka: {format_diag(diag)}\n\n"
                         f"Router (brama): {router_ip or 'nieznany'}\n"
                         f"Cele publiczne: {', '.join(PUBLIC_HOSTS)}\n"
+                        f"Host WAN: {WAN_HOST or 'brak (ANPW_WAN_HOST)'}\n"
                         f"Progi: FAIL>={FAIL_THRESHOLD}, OK>={OK_THRESHOLD}, interwał={INTERVAL_SEC}s\n"
                     )
                     try:
