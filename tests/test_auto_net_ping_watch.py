@@ -8,7 +8,13 @@ Uruchomienie:
 lub:
     python test_auto_net_ping_watch.py
 """
+import sys
+from pathlib import Path
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+    
 import unittest
 from unittest.mock import patch, MagicMock, call
 import smtplib
